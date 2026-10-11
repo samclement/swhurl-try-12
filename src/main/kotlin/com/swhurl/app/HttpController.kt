@@ -48,7 +48,7 @@ class CallerFilter(private val platform: Platform) {
             if (caller.id != null) Span.current().setAttribute("caller.id", caller.id)
             null
         } catch (refused: Unauthorized) {
-            log.warn("request refused: {}", refused.message)
+            log.warn("request refused: ${refused.message}")
             HttpResponse.status<Refusal>(HttpStatus.UNAUTHORIZED).body(Refusal(refused.message ?: "unauthorized"))
         }
     }
@@ -58,6 +58,7 @@ class CallerFilter(private val platform: Platform) {
 class HttpController(
     @Value("\${otel.service.name:swhurl-app}") private val serviceName: String,
     private val platform: Platform,
+    private val events: Events,
 ) {
     private val log = LoggerFactory.getLogger(HttpController::class.java)
 
@@ -74,7 +75,7 @@ class HttpController(
         val caller = caller(request)
         MDC.putCloseable("caller.type", caller.type).use {
             MDC.putCloseable("caller.id", caller.id ?: "").use {
-                log.info("request handled: {} {} {}", request.methodName, request.path, status)
+                log.info("request handled: ${request.methodName} ${request.path} $status")
             }
         }
     }
@@ -97,6 +98,15 @@ class HttpController(
     // The caller is a signed-in person (sign-in happens before requests reach the app), another app, or anonymous.
     @Get("/")
     fun hello(request: HttpRequest<*>): Hello {
+        // An example of publishing: the first event this app declares (events.publish in swhurl.yaml)
+        // goes out on every request. Off the platform, or with nothing declared, nothing happens.
+        events.declaredPublishes().firstOrNull()?.let { declared ->
+            try {
+                events.publish(declared, mapOf("path" to "/", "caller" to caller(request).type))
+            } catch (problem: Exception) {
+                log.error("event not published: $declared: ${problem.message}")
+            }
+        }
         logged(request, 200)
         return Hello("hello from $serviceName", serviceName, caller(request))
     }
