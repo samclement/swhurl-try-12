@@ -7,9 +7,14 @@ import io.micronaut.http.HttpStatus
 import io.micronaut.http.annotation.Controller
 import io.micronaut.http.annotation.Get
 import io.micronaut.http.annotation.PathVariable
+import io.micronaut.http.annotation.Post
 import io.micronaut.http.annotation.RequestFilter
 import io.micronaut.http.annotation.ServerFilter
 import io.micronaut.serde.annotation.Serdeable
+import io.swagger.v3.oas.annotations.Hidden
+import io.swagger.v3.oas.annotations.OpenAPIDefinition
+import io.swagger.v3.oas.annotations.Operation
+import io.swagger.v3.oas.annotations.info.Info
 import io.opentelemetry.api.trace.Span
 import org.slf4j.LoggerFactory
 import org.slf4j.MDC
@@ -22,6 +27,8 @@ data class Hello(
     val message: String,
     val service: String,
     val caller: Caller,
+    // How many times it was asked, when the app keeps a database.
+    val visits: Long?,
 )
 
 @Serdeable
@@ -29,6 +36,9 @@ data class Refusal(val error: String)
 
 @Serdeable
 data class Called(val called: String, val status: Int, val reply: String)
+
+@Serdeable
+data class Notified(val sent: Boolean)
 
 private const val CALLER = "swhurl.caller"
 
@@ -53,7 +63,9 @@ class CallerFilter(private val platform: Platform) {
         }
     }
 }
-
+// What this app offers other apps: src/main/resources/openapi.yaml is generated from the routes
+// below (./gradlew openapi), committed, and served at /openapi.yaml. The platform reads the file.
+@OpenAPIDefinition(info = Info(title = "swhurl-try-12", version = "0.1.0", description = "throwaway: team platform T2 Kotlin caller, delete me"))
 @Controller
 class HttpController(
     @Value("\${otel.service.name:swhurl-app}") private val serviceName: String,
@@ -64,8 +76,14 @@ class HttpController(
 
     // The platform's readiness and liveness probe. It needs nothing else: the app answers only once
     // started. Probe requests are not traced.
+    @Hidden
     @Get("/healthz")
     fun health(): Health = Health(true)
+
+    // The description itself, as other apps and people fetch it.
+    @Hidden
+    @Get("/openapi.yaml", produces = ["application/yaml"])
+    fun openapi(): String = HttpController::class.java.getResource("/openapi.yaml")!!.readText()
 
     private fun caller(request: HttpRequest<*>): Caller =
         request.getAttribute(CALLER, Caller::class.java).orElse(Caller("anonymous", null))
@@ -82,6 +100,7 @@ class HttpController(
 
     // An example of calling another app: GET /call/orders asks the app "orders" for its "/" and returns
     // what it said. It works once this app declares the call (calls: [orders] in swhurl.yaml).
+    @Operation(summary = "Ask another app for its greeting (an example of calling)")
     @Get("/call/{name}")
     fun call(@PathVariable name: String, request: HttpRequest<*>): HttpResponse<Called> {
         val result = try {
@@ -95,19 +114,34 @@ class HttpController(
         return HttpResponse.status<Called>(status).body(result)
     }
 
+    // An example of notifying the team: POST /notify sends a message to the notification channel of
+    // the team that owns this app, and says whether the platform accepted it.
+    @Operation(summary = "Send a message to the team's notification channel (an example)")
+    @Post("/notify")
+    fun notifyTeam(request: HttpRequest<*>): Notified {
+        val sent = platform.notify(
+            "Hello from the example route",
+            message = "Asked for by ${caller(request).id ?: "an anonymous caller"}.",
+        )
+        logged(request, HttpStatus.OK.code)
+        return Notified(sent)
+    }
+
     // The caller is a signed-in person (sign-in happens before requests reach the app), another app, or anonymous.
+    @Operation(summary = "Say hello and name the caller")
     @Get("/")
     fun hello(request: HttpRequest<*>): Hello {
-        // An example of publishing: the first event this app declares (events.publish in swhurl.yaml)
-        // goes out on every request. Off the platform, or with nothing declared, nothing happens.
-        events.declaredPublishes().firstOrNull()?.let { declared ->
+        // An example of publishing: "visited" is described in asyncapi.yaml, which is what lets other
+        // apps find it and subscribe. Off the platform the payload is still checked, and nothing is sent.
+        listOf("visited").forEach { declared ->
             try {
-                events.publish(declared, mapOf("path" to "/", "caller" to caller(request).type))
+                val caller = caller(request)
+                events.publish(declared, mapOf("path" to "/", "caller" to mapOf("type" to caller.type, "id" to caller.id)))
             } catch (problem: Exception) {
                 log.error("event not published: $declared: ${problem.message}")
             }
         }
         logged(request, 200)
-        return Hello("hello from $serviceName", serviceName, caller(request))
+        return Hello("hello from $serviceName", serviceName, caller(request), null)
     }
 }

@@ -13,3 +13,9 @@ resources:
   cpu: 100m
   memory: 192Mi
   memoryLimit: 384Mi
+# What this app offers other apps: its API description (served, and kept in the repository) and its events.
+# The platform reads both files for every image; the events file says what the app publishes.
+provides:
+  api: /openapi.yaml
+  apiFile: src/main/resources/openapi.yaml
+  eventsFile: src/main/resources/asyncapi.yaml
