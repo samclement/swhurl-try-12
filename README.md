@@ -45,6 +45,8 @@ After changing a route, run `./gradlew openapi` and commit `openapi.yaml`: `Open
 
 Locally there are no platform keys or tokens: requests without a token work as before and a request with one is refused; to call another app, set `SWHURL_SERVICE_<NAME>_URL` to a local stub.
 
+Matching merges to `main` publish the image that passed the pull request tests and smoke test; the [template guide](https://github.com/samclement/swhurl-app-template-kotlin#readme) describes the reuse checks and fallback build.
+
 ## Local development
 
 Needs a JDK 25 (Gradle downloads everything else):
