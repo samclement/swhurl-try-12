@@ -18,6 +18,7 @@ import java.security.PrivateKey
 import java.security.Signature
 import java.security.interfaces.RSAPublicKey
 import java.util.Base64
+import tools.jackson.dataformat.yaml.YAMLMapper
 
 private const val ISSUER = "https://kubernetes.default.svc.cluster.local"
 
@@ -40,6 +41,7 @@ class HttpTest : TestPropertyProvider {
             "swhurl.auth.issuer" to ISSUER,
             "swhurl.auth.keys" to """{"keys":[{"kty":"RSA","alg":"RS256","kid":"k1","n":"$n","e":"$e"}]}""",
             "swhurl.allowed.callers" to "reports,billing",
+            "swhurl.description" to "Orders, kept for a year",
         )
     }
 
@@ -60,8 +62,10 @@ class HttpTest : TestPropertyProvider {
         return "$body.${encoder.encodeToString(signature)}"
     }
 
-    private fun root(bearer: String): String =
-        client.toBlocking().retrieve(HttpRequest.GET<Any>("/").header("Authorization", "Bearer $bearer"))
+    private fun root(bearer: String, user: String? = null): String =
+        client.toBlocking().retrieve(
+            HttpRequest.GET<Any>("/").header("Authorization", "Bearer $bearer").apply { if (user != null) header(USER_HEADER, user) },
+        )
 
     @Inject
     @field:Client("/")
@@ -75,6 +79,10 @@ class HttpTest : TestPropertyProvider {
     fun `the API description is served`() {
         val served = client.toBlocking().retrieve("/openapi.yaml")
         assertTrue(served.startsWith("openapi: 3.") && served.contains("\n  /:\n"), served)
+        // Named and described as the platform runs it (SWHURL_APP, SWHURL_DESCRIPTION).
+        val info = YAMLMapper().readTree(served).get("info")
+        assertEquals("orders", info.get("title").asString())
+        assertEquals("Orders, kept for a year", info.get("description").asString())
     }
 
 
@@ -91,6 +99,19 @@ class HttpTest : TestPropertyProvider {
     fun `an allowed app with a token for this app is identified`() {
         val reply = root(token())
         assertTrue(reply.contains(""""type":"app"""") && reply.contains(""""id":"reports""""), reply)
+    }
+
+    @Test
+    fun `an app's token may name the signed-in person it is calling for`() {
+        val reply = root(token(), user = "sam@example.com")
+        assertTrue(reply.contains(""""id":"reports"""") && reply.contains(""""user":"sam@example.com""""), reply)
+        for (bad in listOf("not an email", "a".repeat(250) + "@example.com")) {
+            val error = assertThrows(HttpClientResponseException::class.java, { root(token(), user = bad) }, bad)
+            assertEquals(HttpStatus.UNAUTHORIZED, error.status, bad)
+        }
+        // Without a token nobody can claim a person.
+        val claimed = client.toBlocking().retrieve(HttpRequest.GET<Any>("/").header(USER_HEADER, "sam@example.com"))
+        assertTrue(claimed.contains(""""type":"anonymous"""") && !claimed.contains("sam@example.com"), claimed)
     }
 
     @Test

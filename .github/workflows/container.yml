@@ -16,6 +16,10 @@ permissions:
 
 jobs:
   app:
+<<<<<<< before updating
     uses: samclement/swhurl-app-template-kotlin/.github/workflows/app.yml@v0.2.11
+=======
+    uses: samclement/swhurl-app-template-kotlin/.github/workflows/app.yml@v0.2.12
+>>>>>>> after updating
     with:
       reuse-pr-image: true
