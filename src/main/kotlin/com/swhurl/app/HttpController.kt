@@ -15,6 +15,9 @@ import io.swagger.v3.oas.annotations.Hidden
 import io.swagger.v3.oas.annotations.OpenAPIDefinition
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.info.Info
+import tools.jackson.databind.node.ObjectNode
+import tools.jackson.dataformat.yaml.YAMLMapper
+import tools.jackson.dataformat.yaml.YAMLWriteFeature
 import io.opentelemetry.api.trace.Span
 import org.slf4j.LoggerFactory
 import org.slf4j.MDC
@@ -52,10 +55,15 @@ class CallerFilter(private val platform: Platform) {
     fun identify(request: HttpRequest<*>): HttpResponse<*>? {
         if (request.path == "/healthz") return null
         return try {
-            val caller = platform.identify(request.headers.get("Authorization"), request.headers.get("X-Auth-Request-Email"))
+            val caller = platform.identify(
+                request.headers.get("Authorization"),
+                request.headers.get("X-Auth-Request-Email"),
+                request.headers.get(USER_HEADER),
+            )
             request.setAttribute(CALLER, caller)
             Span.current().setAttribute("caller.type", caller.type)
             if (caller.id != null) Span.current().setAttribute("caller.id", caller.id)
+            if (caller.user != null) Span.current().setAttribute("user.email", caller.user)
             null
         } catch (refused: Unauthorized) {
             log.warn("request refused: ${refused.message}")
@@ -73,17 +81,34 @@ class HttpController(
     private val events: Events,
 ) {
     private val log = LoggerFactory.getLogger(HttpController::class.java)
+    private val yaml = YAMLMapper.builder()
+        .disable(YAMLWriteFeature.WRITE_DOC_START_MARKER)
+        .enable(YAMLWriteFeature.MINIMIZE_QUOTES)
+        .build()
 
-    // The platform's readiness and liveness probe. It needs nothing else: the app answers only once
-    // started. Probe requests are not traced.
+    // The platform's readiness and liveness probe: the app answers only once started, and reports not ready until its feature flag overrides have arrived
+    // (at most 5 s; FlagWatcher). Probe requests are not traced.
     @Hidden
     @Get("/healthz")
-    fun health(): Health = Health(true)
+    fun health(): HttpResponse<Health> =
+        if (Flags.store.loaded) HttpResponse.ok(Health(true)) else HttpResponse.status<Health>(HttpStatus.SERVICE_UNAVAILABLE).body(Health(false))
 
-    // The description itself, as other apps and people fetch it.
+    // The description itself, as other apps and people fetch it: named and described as the platform runs
+    // this app (SWHURL_APP; SWHURL_DESCRIPTION, from swhurl.yaml), so an image built for another app says the
+    // right thing. Off the platform it is the file as committed.
     @Hidden
     @Get("/openapi.yaml", produces = ["application/yaml"])
-    fun openapi(): String = HttpController::class.java.getResource("/openapi.yaml")!!.readText()
+    fun openapi(): String {
+        val text = HttpController::class.java.getResource("/openapi.yaml")!!.readText()
+        val name = platform.setting("SWHURL_APP")
+        val description = platform.setting("SWHURL_DESCRIPTION")
+        if (name == null && description == null) return text
+        val document = yaml.readTree(text) as ObjectNode
+        val info = document.get("info") as ObjectNode
+        name?.let { info.put("title", it) }
+        description?.let { info.put("description", it) }
+        return yaml.writeValueAsString(document)
+    }
 
     private fun caller(request: HttpRequest<*>): Caller =
         request.getAttribute(CALLER, Caller::class.java).orElse(Caller("anonymous", null))
@@ -93,18 +118,21 @@ class HttpController(
         val caller = caller(request)
         MDC.putCloseable("caller.type", caller.type).use {
             MDC.putCloseable("caller.id", caller.id ?: "").use {
-                log.info("request handled: ${request.methodName} ${request.path} $status")
+                MDC.putCloseable("user.email", caller.user ?: "").use {
+                    log.info("request handled: ${request.methodName} ${request.path} $status")
+                }
             }
         }
     }
 
     // An example of calling another app: GET /call/orders asks the app "orders" for its "/" and returns
-    // what it said. It works once this app declares the call (calls: [orders] in swhurl.yaml).
+    // what it said. It works once the platform grants this app the call (make app-calls).
+    // onBehalfOf tells orders who is signed in here, so its "/" names this app and that person.
     @Operation(summary = "Ask another app for its greeting (an example of calling)")
     @Get("/call/{name}")
     fun call(@PathVariable name: String, request: HttpRequest<*>): HttpResponse<Called> {
         val result = try {
-            val reply = platform.call(name, "/")
+            val reply = platform.call(name, "/", onBehalfOf = caller(request))
             Called(name, reply.statusCode(), reply.body())
         } catch (problem: Exception) {
             Called(name, 0, problem.message ?: problem.javaClass.simpleName)
@@ -136,7 +164,8 @@ class HttpController(
         listOf("visited").forEach { declared ->
             try {
                 val caller = caller(request)
-                events.publish(declared, mapOf("path" to "/", "caller" to mapOf("type" to caller.type, "id" to caller.id)))
+                val named = mapOf("type" to caller.type, "id" to caller.id) + (caller.user?.let { mapOf("user" to it) } ?: emptyMap())
+                events.publish(declared, mapOf("path" to "/", "caller" to named))
             } catch (problem: Exception) {
                 log.error("event not published: $declared: ${problem.message}")
             }
